@@ -33,6 +33,7 @@ import static com.minekube.connect.util.ReflectionUtils.invoke;
 
 import com.minekube.connect.inject.CommonPlatformInjector;
 import com.minekube.connect.network.netty.LocalServerChannelWrapper;
+import com.minekube.connect.network.netty.WatchedSingleThreadIoEventLoop;
 import com.velocitypowered.api.proxy.ProxyServer;
 import io.netty.bootstrap.ServerBootstrap;
 import io.netty.channel.Channel;
@@ -40,10 +41,18 @@ import io.netty.channel.ChannelFuture;
 import io.netty.channel.ChannelInitializer;
 import io.netty.channel.ChannelOption;
 import io.netty.channel.EventLoopGroup;
+import io.netty.channel.IoEventLoop;
+import io.netty.channel.IoHandlerFactory;
+import io.netty.channel.MultiThreadIoEventLoopGroup;
 import io.netty.channel.WriteBufferWaterMark;
 import io.netty.channel.local.LocalAddress;
+import io.netty.channel.local.LocalIoHandler;
+import io.netty.util.concurrent.DefaultThreadFactory;
 import java.lang.reflect.Method;
+import java.util.concurrent.Executor;
+import java.util.concurrent.ThreadFactory;
 import lombok.Getter;
+import lombok.NonNull;
 import lombok.RequiredArgsConstructor;
 
 @RequiredArgsConstructor
@@ -54,9 +63,15 @@ public final class VelocityInjector extends CommonPlatformInjector {
 
     @Override
     @SuppressWarnings("rawtypes")
-    public boolean inject() {
+    public boolean inject() throws NoSuchMethodException {
         if (isInjected()) {
             return true;
+        }
+
+        try {
+            Class.forName("io.netty.channel.MultiThreadIoEventLoopGroup");
+        } catch (ClassNotFoundException e) {
+            return false;
         }
 
         Object connectionManager = getValue(server, "cm");
@@ -86,15 +101,32 @@ public final class VelocityInjector extends CommonPlatformInjector {
         WriteBufferWaterMark serverWriteMark = getCastedValue(connectionManager,
                 "SERVER_WRITE_MARK");
 
-        EventLoopGroup bossGroup = castedInvoke(connectionManager, "getBossGroup");
         EventLoopGroup workerGroup = getCastedValue(connectionManager, "workerGroup");
+        EventLoopGroup wrapperGroup = new MultiThreadIoEventLoopGroup(LocalIoHandler.newFactory()) {
+            @Override
+            protected ThreadFactory newDefaultThreadFactory() {
+                return new DefaultThreadFactory("Geyser Backend Worker Group", Thread.MAX_PRIORITY);
+            }
+
+            @Override
+            protected IoEventLoop newChild(Executor executor, IoHandlerFactory ioHandlerFactory, Object... args) {
+                return new WatchedSingleThreadIoEventLoop(workerGroup, this, executor, ioHandlerFactory);
+            }
+        };
+
+        Method initChannel = ChannelInitializer.class.getDeclaredMethod("initChannel", Channel.class);
+        initChannel.setAccessible(true);
 
         ChannelFuture channelFuture = (new ServerBootstrap()
                 .channel(LocalServerChannelWrapper.class)
-                .childHandler(serverInitializer)
-                .group(bossGroup, workerGroup) // Cannot be DefaultEventLoopGroup
-                .childOption(ChannelOption.WRITE_BUFFER_WATER_MARK,
-                        serverWriteMark) // Required or else rare network freezes can occur
+                .childHandler(new ChannelInitializer<>() {
+                    @Override
+                    protected void initChannel(@NonNull Channel ch) throws Exception {
+                        initChannel.invoke(serverInitializer, ch);
+                    }
+                })
+                .group(new MultiThreadIoEventLoopGroup(LocalIoHandler.newFactory()), wrapperGroup)
+                .childOption(ChannelOption.WRITE_BUFFER_WATER_MARK, serverWriteMark) // Required or else rare network freezes can occur
                 .localAddress(LocalAddress.ANY))
                 .bind()
                 .syncUninterruptibly();
@@ -122,7 +154,7 @@ public final class VelocityInjector extends CommonPlatformInjector {
 
         @Override
         protected void initChannel(Channel channel) {
-            invoke(original, initChannel, channel);
+            invoke(original, getMethod(ChannelInitializer.class, "initChannel", Channel.class), channel);
 
             injector.injectAddonsCall(channel, proxyToServer);
             injector.addInjectedClient(channel);

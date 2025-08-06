@@ -57,6 +57,11 @@ public final class VelocityPlugin {
         long endCtm = System.currentTimeMillis();
         injector.getInstance(ConnectLogger.class)
                 .translatedInfo("connect.core.finish", endCtm - ctm);
+
+        // Only use io_uring when velocity does as well
+        if (Boolean.getBoolean("velocity.enable-iouring-transport")) {
+            System.setProperty("Mcpl.io_uring", "true");
+        }
     }
 
     @Subscribe
